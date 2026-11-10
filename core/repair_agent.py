@@ -1,14 +1,16 @@
 """Control a bounded, evidence-based repair conversation."""
 
 import json
-from collections.abc import Mapping, Sequence
+import logging
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import NoReturn
 
 from core.models import ModelAction, RepairResult, TestResult
-from core.ports import ChatClient, RepairToolsPort, ResearchPort
+from core.ports import ChatClient, RepairToolsPort, ResearchPort, TraceRecorder
 from core.prompts import case_request, system_message, tool_result_message
 
+_LOGGER = logging.getLogger(__name__)
 _DECISION_BUDGET = 8
 _TOOL_FIELDS = {
     "read_file": ({"tool", "path", "summary"}, {"tool", "path"}),
@@ -86,21 +88,47 @@ class RepairAgent:
         client: ChatClient,
         tools: RepairToolsPort,
         research: ResearchPort | None = None,
+        recorder: TraceRecorder | None = None,
+        trace_callback: Callable[[Mapping[str, object]], None] | None = None,
     ) -> None:
         self.client = client
         self.tools = tools
         self.research = research
+        self.recorder = recorder
+        self.trace_callback = trace_callback
 
     def run(self, case_name: str, files: Sequence[str]) -> RepairResult:
         """Run at most eight model decisions and return a visible trace."""
         workspace = Path(getattr(self.tools, "workspace", Path(".")))
-        trace: list[dict[str, object]] = [
+        trace: list[dict[str, object]] = []
+
+        def append_event(event: dict[str, object]) -> None:
+            """Store and publish one visible trace event."""
+            trace.append(event)
+            if self.trace_callback is not None:
+                try:
+                    self.trace_callback(event)
+                except Exception:
+                    _LOGGER.warning("Trace callback failed for %s", event.get("event"))
+
+        append_event(
             {
                 "event": "repair_started",
                 "case": case_name,
                 "workspace": str(workspace),
             }
-        ]
+        )
+
+        def record(event: str, payload: dict[str, object]) -> None:
+            """Record telemetry best-effort without changing repair behavior."""
+            if self.recorder is None:
+                return
+            try:
+                self.recorder.record(event, payload)
+            except Exception:
+                _LOGGER.warning("Observability recorder failed for %s", event)
+
+        record("repair_started", {"case_name": case_name})
         messages = [
             system_message(research_enabled=self.research is not None),
             case_request(case_name, files),
@@ -112,14 +140,23 @@ class RepairAgent:
         has_edit = False
 
         def finish(passed: bool, reason: str) -> RepairResult:
-            trace.append(
+            tool_changed_files = getattr(self.tools, "changed_files", changed_files)
+            append_event(
                 {
                     "event": "repair_finished",
                     "passed": passed,
                     "reason": reason,
                 }
             )
-            tool_changed_files = getattr(self.tools, "changed_files", changed_files)
+            record(
+                "repair_finished",
+                {
+                    "case_name": case_name,
+                    "passed": passed,
+                    "changed_relative_file_names": list(tool_changed_files),
+                    "final_outcome": "passed" if passed else "failed",
+                },
+            )
             return RepairResult(
                 passed=passed,
                 trace=trace,
@@ -128,12 +165,16 @@ class RepairAgent:
                 test_result=test_result,
             )
 
-        for _ in range(_DECISION_BUDGET):
+        for step_number in range(1, _DECISION_BUDGET + 1):
             try:
                 reply = self.client.chat(messages)
             except Exception as error:
                 message = f"Client error: {error}"
-                trace.append({"event": "model_response", "error": message})
+                append_event({"event": "model_response", "error": message})
+                record(
+                    "model_response",
+                    {"step_number": step_number, "passed": False},
+                )
                 return finish(False, message)
 
             try:
@@ -143,7 +184,11 @@ class RepairAgent:
                 )
             except (json.JSONDecodeError, TypeError, ValueError) as error:
                 message = f"Invalid model reply: {error}"
-                trace.append({"event": "model_response", "valid": False, "error": message})
+                append_event({"event": "model_response", "valid": False, "error": message})
+                record(
+                    "model_response",
+                    {"step_number": step_number, "passed": False},
+                )
                 return finish(False, message)
 
             messages.append({"role": "assistant", "content": reply})
@@ -154,19 +199,35 @@ class RepairAgent:
             }
             if action.summary is not None:
                 response_event["summary"] = action.summary
-            trace.append(response_event)
+            append_event(response_event)
+            record(
+                "model_response",
+                {
+                    "step_number": step_number,
+                    "requested_tool": action.tool,
+                    "public_summary": action.summary or "",
+                },
+            )
 
             if action.tool == "edit_file" and not (has_read and has_failing_baseline):
                 observation = (
                     "Policy error: edit_file requires a successful read_file and a "
                     "failing run_tests observation before the edit."
                 )
-                trace.append(
+                append_event(
                     {
                         "event": "tool_result",
                         "tool": "policy_error",
                         "error": observation,
                     }
+                )
+                record(
+                    "tool_result",
+                    {
+                        "step_number": step_number,
+                        "requested_tool": action.tool,
+                        "passed": False,
+                    },
                 )
                 messages.append(tool_result_message("policy_error", observation))
                 continue
@@ -177,12 +238,20 @@ class RepairAgent:
                     "Policy error: search_github requires a successful read_file and a "
                     "failing run_tests observation before research."
                 )
-                trace.append(
+                append_event(
                     {
                         "event": "tool_result",
                         "tool": "policy_error",
                         "error": observation,
                     }
+                )
+                record(
+                    "tool_result",
+                    {
+                        "step_number": step_number,
+                        "requested_tool": action.tool,
+                        "passed": False,
+                    },
                 )
                 messages.append(tool_result_message("policy_error", observation))
                 continue
@@ -193,8 +262,16 @@ class RepairAgent:
                     if not isinstance(output, str):
                         raise TypeError("read_file must return text")
                     has_read = True
-                    trace.append(
+                    append_event(
                         {"event": "tool_result", "tool": action.tool, "output": output}
+                    )
+                    record(
+                        "tool_result",
+                        {
+                            "step_number": step_number,
+                            "requested_tool": action.tool,
+                            "passed": True,
+                        },
                     )
                     messages.append(tool_result_message(action.tool, output))
                 elif action.tool == "run_tests":
@@ -207,7 +284,7 @@ class RepairAgent:
                         f"returncode: {result.returncode}\n"
                         f"output:\n{result.output}"
                     )
-                    trace.append(
+                    append_event(
                         {
                             "event": "tool_result",
                             "tool": action.tool,
@@ -215,6 +292,15 @@ class RepairAgent:
                             "returncode": result.returncode,
                             "output": result.output,
                         }
+                    )
+                    record(
+                        "tool_result",
+                        {
+                            "step_number": step_number,
+                            "requested_tool": action.tool,
+                            "passed": result.passed,
+                            "return_code": result.returncode,
+                        },
                     )
                     messages.append(tool_result_message(action.tool, observation))
                     if result.passed and not has_edit:
@@ -231,12 +317,20 @@ class RepairAgent:
                         raise RuntimeError("GitHub research is not enabled")
                     evidence = self.research.search_github(action.arguments["query"])
                     observation = json.dumps(evidence, ensure_ascii=False)
-                    trace.append(
+                    append_event(
                         {
                             "event": "tool_result",
                             "tool": action.tool,
                             "output": evidence,
                         }
+                    )
+                    record(
+                        "tool_result",
+                        {
+                            "step_number": step_number,
+                            "requested_tool": action.tool,
+                            "passed": True,
+                        },
                     )
                     messages.append(tool_result_message(action.tool, observation))
                 else:
@@ -253,18 +347,35 @@ class RepairAgent:
                         if path not in changed_files:
                             changed_files.append(path)
                     output = f"Edited {action.arguments['path']}."
-                    trace.append(
+                    append_event(
                         {"event": "tool_result", "tool": action.tool, "output": output}
+                    )
+                    record(
+                        "tool_result",
+                        {
+                            "step_number": step_number,
+                            "requested_tool": action.tool,
+                            "passed": True,
+                            "changed_relative_file_names": list(changed_files),
+                        },
                     )
                     messages.append(tool_result_message(action.tool, output))
             except Exception as error:
                 observation = f"Tool error: {error}"
-                trace.append(
+                append_event(
                     {
                         "event": "tool_result",
                         "tool": action.tool,
                         "error": observation,
                     }
+                )
+                record(
+                    "tool_result",
+                    {
+                        "step_number": step_number,
+                        "requested_tool": action.tool,
+                        "passed": False,
+                    },
                 )
                 messages.append(tool_result_message(action.tool, observation))
 

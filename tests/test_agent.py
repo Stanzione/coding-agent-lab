@@ -100,6 +100,33 @@ def test_successful_read_failure_edit_and_passing_test() -> None:
     assert "source" in client.conversations[1][-1]["content"]
 
 
+def test_trace_callback_receives_the_stored_trace_in_order() -> None:
+    """Publish each event as it is stored without changing the trace."""
+    events: list[Mapping[str, object]] = []
+    client = ScriptedClient(
+        [
+            action("read_file", path="calculator.py", summary="Inspect source"),
+            action("run_tests", summary="Check baseline"),
+        ]
+    )
+    tools = FakeTools([StructuredTestResult(True, "1 passed", 0)])
+
+    result = RepairAgent(client, tools, trace_callback=events.append).run(
+        "arithmetic",
+        ["calculator.py"],
+    )
+
+    assert events == result.trace
+    assert [event["event"] for event in events] == [
+        "repair_started",
+        "model_response",
+        "tool_result",
+        "model_response",
+        "tool_result",
+        "repair_finished",
+    ]
+
+
 def test_invalid_json_fails_without_calling_a_tool() -> None:
     """Reject malformed replies before dispatching any tool."""
     tools = FakeTools()

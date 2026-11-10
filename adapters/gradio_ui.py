@@ -2,13 +2,17 @@
 
 import json
 import os
+import queue
 import tempfile
+import threading
 import zipfile
-from collections.abc import Callable
+import textwrap
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import gradio as gr
 
+from core.models import RepairResult
 from core.repair_service import RepairService
 
 _CASES = (
@@ -23,6 +27,82 @@ _PROVIDERS = (
     ("ollama (modelo configurado)", "ollama"),
     ("qwen2.5-coder:14b", "qwen"),
 )
+_LANGFUSE_ENVIRONMENT = (
+    "LANGFUSE_PUBLIC_KEY",
+    "LANGFUSE_SECRET_KEY",
+    "LANGFUSE_BASE_URL",
+)
+
+
+def _selected_service(
+    provider: str,
+    research_enabled: bool,
+    service: RepairService | None,
+    service_factory: Callable[..., RepairService],
+    trace_callback: Callable[[Mapping[str, object]], None] | None = None,
+) -> RepairService:
+    """Create the selected provider service and enable Qwen observability."""
+    if provider == "scripted" and service is not None:
+        return service
+    if provider == "qwen":
+        missing = [name for name in _LANGFUSE_ENVIRONMENT if not os.environ.get(name)]
+        if missing:
+            raise ValueError(
+                "Qwen Langfuse observability requires environment variables: "
+                f"{', '.join(missing)}"
+            )
+        return service_factory(
+            "ollama",
+            model="qwen2.5-coder:14b",
+            research_enabled=research_enabled,
+            observe_enabled=True,
+            trace_callback=trace_callback,
+        )
+    if provider == "ollama":
+        return service_factory("ollama", trace_callback=trace_callback)
+    if provider == "scripted":
+        return service_factory("scripted", trace_callback=trace_callback)
+    raise ValueError(f"Unknown provider: {provider}")
+
+
+def _format_trace_event(event: Mapping[str, object]) -> str:
+    """Format one repair event as a concise labeled UI step."""
+    event_type = event.get("event")
+    if event_type == "repair_started":
+        return f"[START] {event.get('case', 'repair')}"
+    if event_type == "model_response":
+        if event.get("valid") is False:
+            return f"[ACTION] Invalid model response: {event.get('error', '')}"
+        if "error" in event:
+            return f"[ACTION] Model error: {event['error']}"
+        tool = str(event.get("tool", "unknown")).upper()
+        summary = event.get("summary")
+        suffix = f" - {summary}" if summary else ""
+        return f"[ACTION] {tool}{suffix}"
+    if event_type == "tool_result":
+        lines = [f"[RESULT] {event.get('tool', 'tool')}"]
+        if "passed" in event:
+            lines.append(f"  status: {'passed' if event['passed'] else 'failed'}")
+        if "returncode" in event:
+            lines.append(f"  return code: {event['returncode']}")
+        if "error" in event:
+            output = str(event["error"])
+        elif "output" in event:
+            value = event["output"]
+            output = (
+                json.dumps(value, ensure_ascii=False, indent=2)
+                if isinstance(value, (dict, list))
+                else str(value)
+            )
+        else:
+            output = ""
+        if output:
+            lines.append(textwrap.indent(output.rstrip("\n"), "  "))
+        return "\n".join(lines)
+    if event_type == "repair_finished":
+        status = "PASS" if event.get("passed") else "FAILED"
+        return f"[FINISHED] {status} - {event.get('reason', '')}"
+    return ""
 
 
 def get_download_directory() -> Path:
@@ -69,46 +149,72 @@ def create_demo(
 
         service_factory = create_repair_service
 
-    def selected_service(provider: str, research_enabled: bool) -> RepairService:
-        """Create a service using the provider selected in the page."""
-        if provider == "scripted" and service is not None:
-            return service
-        if provider == "qwen":
-            return service_factory(
-                "ollama",
-                model="qwen2.5-coder:14b",
-                research_enabled=research_enabled,
-            )
-        if provider == "ollama":
-            return service_factory("ollama")
-        if provider == "scripted":
-            return service_factory("scripted")
-        raise ValueError(f"Unknown provider: {provider}")
-
     def repair(
         case_name: str,
         provider: str,
         research_enabled: bool,
-    ) -> tuple[str, str, str, str | None]:
-        """Run the selected case through the injected repair service."""
+    ):
+        """Stream labeled trace events and return the final repair artifacts."""
         if case_name not in _CASES:
-            return f"Unknown evaluation case: {case_name}", "", "", None
+            yield f"Unknown evaluation case: {case_name}", "", "", None
+            return
+        events: queue.Queue[
+            tuple[str, Mapping[str, object] | RepairResult | Exception | None]
+        ] = queue.Queue()
+
+        def publish(event: Mapping[str, object]) -> None:
+            """Forward an agent trace event to the Gradio generator."""
+            events.put(("event", dict(event)))
+
         try:
-            repair_service = selected_service(
+            repair_service = _selected_service(
                 provider,
-                research_enabled=provider == "qwen" and research_enabled,
+                provider == "qwen" and research_enabled,
+                service,
+                service_factory,
+                publish,
             )
         except ValueError as error:
-            return f"Repair failed: {error}", "", "", None
-        try:
-            result = repair_service.repair(f"evals/{case_name}")
-        except (OSError, ValueError) as error:
-            return f"Repair failed: {error}", "", "", None
+            yield f"Repair failed: {error}", "", "", None
+            return
 
-        trace = "\n".join(
-            json.dumps(event, ensure_ascii=False)
-            for event in result.trace
-        )
+        def run_repair() -> None:
+            """Run repair off-thread so trace events can stream to the page."""
+            try:
+                events.put(("result", repair_service.repair(f"evals/{case_name}")))
+            except Exception as error:
+                events.put(("error", error))
+            finally:
+                events.put(("finished", None))
+
+        worker = threading.Thread(target=run_repair, daemon=True)
+        worker.start()
+        trace_lines: list[str] = []
+        result: RepairResult | None = None
+        while True:
+            kind, payload = events.get()
+            if kind == "event" and isinstance(payload, Mapping):
+                formatted = _format_trace_event(payload)
+                if formatted:
+                    trace_lines.append(formatted)
+                    yield "\n\n".join(trace_lines), "", "", None
+            elif kind == "result" and isinstance(payload, RepairResult):
+                result = payload
+            elif kind == "error" and isinstance(payload, Exception):
+                yield f"Repair failed: {payload}", "", "", None
+            elif kind == "finished":
+                break
+
+        if result is None:
+            return
+
+        if not trace_lines:
+            trace_lines = [
+                line
+                for event in result.trace
+                if (line := _format_trace_event(event))
+            ]
+        trace = "\n\n".join(trace_lines)
         changed_text: list[str] = []
         workspace = Path(result.workspace)
         for relative_path in result.changed_files:
@@ -121,18 +227,30 @@ def create_demo(
                 f"--- {relative_path} ---\n"
                 f"{changed_path.read_text(encoding='utf-8')}"
             )
+        changed_output = "Changed files:"
+        if result.changed_files:
+            changed_output += "\n" + "\n".join(
+                f"- {relative_path}" for relative_path in result.changed_files
+            )
+        if changed_text:
+            changed_output += "\n\n" + "\n\n".join(changed_text)
 
         test_result = result.test_result
         if test_result is None:
-            test_output = "Tests were not run."
+            test_output = "Final sandboxed test result: NOT RUN"
         else:
             test_output = (
-                f"passed: {test_result.passed}\n"
-                f"returncode: {test_result.returncode}\n"
-                f"{test_result.output}"
+                "Final sandboxed test result: "
+                f"{'PASSED' if test_result.passed else 'FAILED'} "
+                f"(return code {test_result.returncode})"
             )
+            if test_result.output:
+                test_output += "\n" + textwrap.indent(
+                    test_result.output.rstrip("\n"),
+                    "  ",
+                )
         archive = _workspace_zip(workspace, case_name)
-        return trace, "\n\n".join(changed_text), test_output, archive
+        yield trace, changed_output, test_output, archive
 
     with gr.Blocks(title="Coding Agent Lab") as demo:
         gr.Markdown("# Coding Agent Lab\nRun a scripted repair on a supplied evaluation.")

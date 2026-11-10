@@ -11,7 +11,7 @@ from adapters.models.scripted import ScriptedClient
 from adapters.sandbox import runner
 from adapters.sandbox.repair_tools import RepairTools
 from core.models import TestResult
-from core.ports import ChatClient, RepairToolsPort, ResearchPort
+from core.ports import ChatClient, RepairToolsPort, ResearchPort, TraceRecorder
 from core.repair_agent import RepairAgent
 from core.repair_service import RepairService
 
@@ -235,8 +235,9 @@ def create_repair_service(
     model: str | None = None,
     temperature: float | None = None,
     research_enabled: bool = False,
+    observe_enabled: bool = False,
 ) -> RepairService:
-    """Build the repair service with a scripted or local Ollama client."""
+    """Build the repair service with optional research and observability."""
     if provider not in {"scripted", "ollama"}:
         raise ValueError(f"unsupported provider: {provider}")
     if provider == "scripted" and (model is not None or temperature is not None):
@@ -247,6 +248,15 @@ def create_repair_service(
 
         research_token = os.environ.get("GITHUB_TOKEN")
         research_factory = lambda: GitHubResearch(token=research_token)
+    recorder: TraceRecorder | None = None
+    if observe_enabled:
+        from adapters.observability.langfuse import LangfuseTrajectoryRecorder
+
+        recorder = LangfuseTrajectoryRecorder(
+            public_key=os.environ["LANGFUSE_PUBLIC_KEY"],
+            secret_key=os.environ["LANGFUSE_SECRET_KEY"],
+            base_url=os.environ["LANGFUSE_BASE_URL"],
+        )
 
     def client_for_case(case: str) -> ChatClient:
         if provider == "ollama":
@@ -257,19 +267,25 @@ def create_repair_service(
             except KeyError as error:
                 raise ValueError(f"no scripted replies for evaluation: {case}") from error
             client = ScriptedClient(replies)
-        return _TracingClient(client, trace_callback)
+        return _TracingClient(client, None)
 
     def tools_for_workspace(workspace: Path) -> RepairToolsPort:
-        return _TracingTools(RepairTools(workspace), trace_callback)
+        return _TracingTools(RepairTools(workspace), None)
 
     def create_agent(client: ChatClient, tools: RepairToolsPort) -> RepairAgent:
         research = research_factory() if research_factory is not None else None
-        return RepairAgent(client, tools, research=research)
+        return RepairAgent(
+            client,
+            tools,
+            research=research,
+            recorder=recorder,
+            trace_callback=trace_callback,
+        )
 
     return RepairService(
         workspace_factory=runner.create_workspace,
         tools_factory=tools_for_workspace,
         client_factory=client_for_case,
         agent_factory=create_agent,
-        trace_callback=trace_callback,
+        trace_callback=None,
     )
