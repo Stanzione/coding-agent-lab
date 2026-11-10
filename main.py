@@ -28,6 +28,11 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         help="Ollama sampling temperature",
     )
+    repair_parser.add_argument(
+        "--research",
+        action="store_true",
+        help="enable optional bounded public GitHub code-search evidence",
+    )
     ui_parser = subparsers.add_parser("ui", help="launch the Gradio repair page")
     ui_parser.add_argument(
         "--provider",
@@ -58,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             model=args.model,
             temperature=args.temperature,
+            research_enabled=args.research,
         )
         result = service.repair(args.project)
     except (OSError, ValueError) as error:

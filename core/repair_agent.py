@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from core.models import ModelAction, RepairResult, TestResult
-from core.ports import ChatClient, RepairToolsPort
+from core.ports import ChatClient, RepairToolsPort, ResearchPort
 from core.prompts import case_request, system_message, tool_result_message
 
 _DECISION_BUDGET = 8
@@ -17,6 +17,7 @@ _TOOL_FIELDS = {
         {"tool", "path", "content", "summary"},
         {"tool", "path", "content"},
     ),
+    "search_github": ({"tool", "query", "summary"}, {"tool", "query"}),
 }
 
 
@@ -35,7 +36,7 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def _parse_action(reply: str) -> ModelAction:
+def _parse_action(reply: str, research_enabled: bool = False) -> ModelAction:
     """Validate one JSON tool action and convert it to a model."""
     value = json.loads(
         reply,
@@ -45,18 +46,28 @@ def _parse_action(reply: str) -> ModelAction:
     if not isinstance(value, dict):
         raise ValueError("reply must be one JSON object")
 
-    tool = value.get("tool")
-    if not isinstance(tool, str) or tool not in _TOOL_FIELDS:
-        raise ValueError("tool must be read_file, run_tests, or edit_file")
+    tool_fields = _TOOL_FIELDS
+    if not research_enabled:
+        tool_fields = {
+            name: fields for name, fields in _TOOL_FIELDS.items()
+            if name != "search_github"
+        }
 
-    allowed_fields, required_fields = _TOOL_FIELDS[tool]
+    tool = value.get("tool")
+    if not isinstance(tool, str) or tool not in tool_fields:
+        allowed = "read_file, run_tests, and edit_file"
+        if research_enabled:
+            allowed += ", and search_github"
+        raise ValueError(f"tool must be {allowed}")
+
+    allowed_fields, required_fields = tool_fields[tool]
     fields = set(value)
     if fields - allowed_fields:
         raise ValueError(f"unexpected fields: {', '.join(sorted(fields - allowed_fields))}")
     if required_fields - fields:
         raise ValueError(f"missing fields: {', '.join(sorted(required_fields - fields))}")
 
-    for field in ("path", "content"):
+    for field in ("path", "content", "query"):
         if field in required_fields and not isinstance(value.get(field), str):
             raise ValueError(f"{field} must be a string")
     summary = value.get("summary")
@@ -70,9 +81,15 @@ def _parse_action(reply: str) -> ModelAction:
 class RepairAgent:
     """Ask for permitted actions and enforce evidence before repairs."""
 
-    def __init__(self, client: ChatClient, tools: RepairToolsPort) -> None:
+    def __init__(
+        self,
+        client: ChatClient,
+        tools: RepairToolsPort,
+        research: ResearchPort | None = None,
+    ) -> None:
         self.client = client
         self.tools = tools
+        self.research = research
 
     def run(self, case_name: str, files: Sequence[str]) -> RepairResult:
         """Run at most eight model decisions and return a visible trace."""
@@ -84,7 +101,10 @@ class RepairAgent:
                 "workspace": str(workspace),
             }
         ]
-        messages = [system_message(), case_request(case_name, files)]
+        messages = [
+            system_message(research_enabled=self.research is not None),
+            case_request(case_name, files),
+        ]
         changed_files: list[str] = []
         test_result: TestResult | None = None
         has_read = False
@@ -117,7 +137,10 @@ class RepairAgent:
                 return finish(False, message)
 
             try:
-                action = _parse_action(reply)
+                action = _parse_action(
+                    reply,
+                    research_enabled=self.research is not None,
+                )
             except (json.JSONDecodeError, TypeError, ValueError) as error:
                 message = f"Invalid model reply: {error}"
                 trace.append({"event": "model_response", "valid": False, "error": message})
@@ -137,6 +160,22 @@ class RepairAgent:
                 observation = (
                     "Policy error: edit_file requires a successful read_file and a "
                     "failing run_tests observation before the edit."
+                )
+                trace.append(
+                    {
+                        "event": "tool_result",
+                        "tool": "policy_error",
+                        "error": observation,
+                    }
+                )
+                messages.append(tool_result_message("policy_error", observation))
+                continue
+            if action.tool == "search_github" and not (
+                has_read and has_failing_baseline
+            ):
+                observation = (
+                    "Policy error: search_github requires a successful read_file and a "
+                    "failing run_tests observation before research."
                 )
                 trace.append(
                     {
@@ -187,6 +226,19 @@ class RepairAgent:
                         has_failing_baseline = True
                     if result.passed and has_edit and has_failing_baseline:
                         return finish(True, "Tests passed after the repair.")
+                elif action.tool == "search_github":
+                    if self.research is None:
+                        raise RuntimeError("GitHub research is not enabled")
+                    evidence = self.research.search_github(action.arguments["query"])
+                    observation = json.dumps(evidence, ensure_ascii=False)
+                    trace.append(
+                        {
+                            "event": "tool_result",
+                            "tool": action.tool,
+                            "output": evidence,
+                        }
+                    )
+                    messages.append(tool_result_message(action.tool, observation))
                 else:
                     self.tools.edit_file(
                         action.arguments["path"],

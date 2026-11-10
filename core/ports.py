@@ -21,6 +21,12 @@ class RepairToolsPort(Protocol):
     def run_tests(self) -> TestResult: ...
 
 
+class ResearchPort(Protocol):
+    """Provide optional, bounded GitHub search evidence."""
+
+    def search_github(self, query: str) -> dict[str, object]: ...
+
+
 class TraceRecorder(Protocol):
     """Record an event and its structured payload."""
 

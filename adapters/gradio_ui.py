@@ -69,24 +69,35 @@ def create_demo(
 
         service_factory = create_repair_service
 
-    def selected_service(provider: str) -> RepairService:
+    def selected_service(provider: str, research_enabled: bool) -> RepairService:
         """Create a service using the provider selected in the page."""
         if provider == "scripted" and service is not None:
             return service
         if provider == "qwen":
-            return service_factory("ollama", model="qwen2.5-coder:14b")
+            return service_factory(
+                "ollama",
+                model="qwen2.5-coder:14b",
+                research_enabled=research_enabled,
+            )
         if provider == "ollama":
             return service_factory("ollama")
         if provider == "scripted":
             return service_factory("scripted")
         raise ValueError(f"Unknown provider: {provider}")
 
-    def repair(case_name: str, provider: str) -> tuple[str, str, str, str | None]:
+    def repair(
+        case_name: str,
+        provider: str,
+        research_enabled: bool,
+    ) -> tuple[str, str, str, str | None]:
         """Run the selected case through the injected repair service."""
         if case_name not in _CASES:
             return f"Unknown evaluation case: {case_name}", "", "", None
         try:
-            repair_service = selected_service(provider)
+            repair_service = selected_service(
+                provider,
+                research_enabled=provider == "qwen" and research_enabled,
+            )
         except ValueError as error:
             return f"Repair failed: {error}", "", "", None
         try:
@@ -135,6 +146,19 @@ def create_demo(
             value="scripted",
             label="AI provider/model",
         )
+        research_toggle = gr.Checkbox(
+            label="Enable optional GitHub code search (Qwen only)",
+            value=False,
+            interactive=False,
+        )
+        provider_selector.change(
+            fn=lambda provider: gr.update(
+                interactive=provider == "qwen",
+                value=False,
+            ),
+            inputs=provider_selector,
+            outputs=research_toggle,
+        )
         start_button = gr.Button("Start repair")
         trace_output = gr.Textbox(label="Visible trace", lines=14, interactive=False)
         changed_output = gr.Textbox(
@@ -146,7 +170,7 @@ def create_demo(
         download_output = gr.File(label="Download repaired workspace ZIP", interactive=False)
         start_button.click(
             fn=repair,
-            inputs=[case_selector, provider_selector],
+            inputs=[case_selector, provider_selector, research_toggle],
             outputs=[trace_output, changed_output, test_output, download_output],
         )
     return demo

@@ -3,8 +3,17 @@
 from collections.abc import Sequence
 
 
-def system_message() -> dict[str, str]:
+def system_message(research_enabled: bool = False) -> dict[str, str]:
     """Return the repair agent's system instruction."""
+    research_instruction = ""
+    if research_enabled:
+        research_instruction = (
+            "\nOptional GitHub research may provide supporting evidence, but it is "
+            "not an authority and must not override local code or test results. "
+            "Use it only after reading local code and observing a failing test. "
+            'Example: {"tool":"search_github","query":"Python median even length",'
+            '"summary":"Find a public reference"}'
+        )
     return {
         "role": "system",
         "content": (
@@ -18,6 +27,7 @@ def system_message() -> dict[str, str]:
             '{"tool":"edit_file","path":"calculator.py","content":"..."}\n'
             "The optional summary is a short label shown in the trace, not "
             "private reasoning."
+            f"{research_instruction}"
         ),
     }
 

@@ -1,6 +1,7 @@
 """Connect the repair agent to the scripted model and Docker-backed tools."""
 
 import json
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Callable
@@ -10,7 +11,7 @@ from adapters.models.scripted import ScriptedClient
 from adapters.sandbox import runner
 from adapters.sandbox.repair_tools import RepairTools
 from core.models import TestResult
-from core.ports import ChatClient, RepairToolsPort
+from core.ports import ChatClient, RepairToolsPort, ResearchPort
 from core.repair_agent import RepairAgent
 from core.repair_service import RepairService
 
@@ -233,12 +234,19 @@ def create_repair_service(
     trace_callback: TraceCallback | None = None,
     model: str | None = None,
     temperature: float | None = None,
+    research_enabled: bool = False,
 ) -> RepairService:
     """Build the repair service with a scripted or local Ollama client."""
     if provider not in {"scripted", "ollama"}:
         raise ValueError(f"unsupported provider: {provider}")
     if provider == "scripted" and (model is not None or temperature is not None):
         raise ValueError("--model and --temperature are only supported with --provider ollama")
+    research_factory: Callable[[], ResearchPort] | None = None
+    if research_enabled:
+        from adapters.research.github_research import GitHubResearch
+
+        research_token = os.environ.get("GITHUB_TOKEN")
+        research_factory = lambda: GitHubResearch(token=research_token)
 
     def client_for_case(case: str) -> ChatClient:
         if provider == "ollama":
@@ -254,10 +262,14 @@ def create_repair_service(
     def tools_for_workspace(workspace: Path) -> RepairToolsPort:
         return _TracingTools(RepairTools(workspace), trace_callback)
 
+    def create_agent(client: ChatClient, tools: RepairToolsPort) -> RepairAgent:
+        research = research_factory() if research_factory is not None else None
+        return RepairAgent(client, tools, research=research)
+
     return RepairService(
         workspace_factory=runner.create_workspace,
         tools_factory=tools_for_workspace,
         client_factory=client_for_case,
-        agent_factory=lambda client, tools: RepairAgent(client, tools),
+        agent_factory=create_agent,
         trace_callback=trace_callback,
     )
